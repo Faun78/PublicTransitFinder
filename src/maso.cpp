@@ -39,6 +39,7 @@ bool loadSchools(std::vector<SchoolLookup>& schools, const std::string& csvPath)
 }
 
 void getTimeForQuery(const std::string& dateStr, const std::string& timeStr, std::tm& tm) {
+    tm.tm_isdst = -1;
     strptime((dateStr + " " + timeStr).c_str(), "%d.%m.%Y %H:%M", &tm);
 }
 
@@ -74,7 +75,7 @@ int main(int argc, char** argv) {
 
     
     bool onlineMode = true;
-    MHDCore core("MHD_NET", onlineMode, Logger::Level::INFO);
+    MHDCore core("MHD_NET", onlineMode, Logger::Level::INFO, true);
     if (!core.loadGTFS(gtfsDir, APIEndpoint::CUSTOM)) {
         return 2;
     }
@@ -82,7 +83,7 @@ int main(int argc, char** argv) {
     if (!loadSchools(schools, lookupCsvPath)) {
         return 3;
     }
-    std::tm queryTm;
+    std::tm queryTm = {};
     getTimeForQuery(dateArg, timeArg, queryTm);
     // Maybe we can make this parallel but now it is just a concept
     auto qID = core.newQuery(queryTm);

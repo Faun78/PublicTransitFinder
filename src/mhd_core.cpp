@@ -14,7 +14,7 @@ int MHDCore::newQuery(tm currentTime, SearchPriority searchPriority,
         double walkingFactor, uint32_t maxWalkingDistance, double walkingSpeed, int maxTransfers,
         std::ostream* outStream) {
     querries.emplace_back(network, currentTime, searchPriority,
-            walkingFactor, maxWalkingDistance, walkingSpeed, outStream);
+            walkingFactor, maxWalkingDistance, walkingSpeed, outStream, multiCoreMode);
     querries.back().setMaxTransfers(maxTransfers);
     return static_cast<int>(querries.size() - 1);
 }

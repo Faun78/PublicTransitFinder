@@ -1,4 +1,10 @@
+#include "query.h"
+#include "network.h"
 #include "query_search.h"
+#include "stations.h"
+#include <cstdint>
+#include <memory>
+#include <mutex>
 
 void Query::writeTripSegmentCsvRow(std::ostream& output, const std::string& stationName,
         uint32_t arrivalDate, uint32_t arrivalTime, const Location& location, bool transferFlag) {
@@ -9,7 +15,19 @@ void Query::writeTripSegmentCsvRow(std::ostream& output, const std::string& stat
            << location.longitude << ',' << (transferFlag ? 1 : 0) << '\n';
 }
 void Query::buildWalkingIndex() {
-    QuerySearch(*this).buildWalkingIndex();
+    network.getLogger().info("Building walking index for " + std::string( sharedWalkingEdges ? "shared" : "query-specific" )+ " walking edges...");
+    if (sharedWalkingEdges) {
+        if (network.getWalkingIndex().empty()) {
+            network.getLogger().info("Building shared walking index...");
+            QuerySearch(*this).buildWalkingIndex();
+            network.copyWalkingIndexFromQuery(this->walkingIndex);
+            network.getLogger().info("Shared walking index successfully synchronized with " + 
+                                     std::to_string(network.getWalkingIndex().size()) + " stations.");
+            this->walkingIndex.clear();
+        }
+    }else{
+        QuerySearch(*this).buildWalkingIndex();
+    }
 }
 
 void Query::findPathsByStationIds(uint32_t startStationId,
@@ -160,6 +178,71 @@ bool Query::printRoute(const Path& path, int& pathCount, int maxPaths) const {
     if (out)
         (*out) << '\n';
     return pathCount < maxPaths;
+}
+
+std::mutex mutex_local = std::mutex();
+
+void Query::addWalkingToPathStart(Location startloc) {
+    for (auto& path : paths) {
+        if (path.getLegs().empty())
+            continue;
+        // Generate a staionID for this lookup if we don't have a valid start station
+        uint32_t id = network.getStationByLocation(startloc);
+        Location loc = network.getStationLocation(id);
+        if (calcDistance(loc, startloc) < walkingSpeed * 60) { 
+            continue;
+        }
+        mutex_local.lock();
+        // else create new fake station and add walking leg to the start of the path
+        int count = network.getStationCount();
+        StationPtr station = std::make_unique<Station>(
+                count, "Start Location", startloc, Platform(count, startloc).first);
+        network.addStation(station);
+        mutex_local.unlock();
+        PathLeg leg { };
+        leg.isWalk = true;
+        leg.stationId = count;
+        leg.arrivalDate = getLookupDate();
+        leg.arrivalTime = getLookupTime();
+        leg.departureTime = getLookupTime();
+        leg.walkSeconds = static_cast<uint32_t>(calcDistance(startloc, network.getStationLocation(path.getLegs().front().stationId)) / walkingSpeed);
+        Path newPath;
+        newPath.addLeg(leg);
+        for (const auto& l : path.getLegs()) {
+            newPath.addLeg(l);
+        }
+        path = newPath;
+    }
+}
+
+void Query::addWalkingToPathEnd(Location endloc) {
+    for (auto& path : paths) {
+        if (path.getLegs().empty()) continue;
+
+        const PathLeg& lastTransitLeg = path.getLegs().back();
+        uint32_t id = network.getStationByLocation(endloc);
+        Location loc = network.getStationLocation(id);
+        if (calcDistance(loc, endloc) < walkingSpeed * 60) { 
+            continue;
+        }
+        mutex_local.lock();
+        int count = network.getStationCount();
+        StationPtr station = std::make_unique<Station>(
+                count, "Start Location", endloc, Platform(count, endloc).first);
+        network.addStation(station);
+        mutex_local.unlock();
+        PathLeg leg { };
+        leg.isWalk = true;
+        leg.stationId = count;
+        leg.arrivalDate = lastTransitLeg.arrivalDate;
+        leg.departureTime = lastTransitLeg.arrivalTime; 
+        
+        uint32_t walkDuration = static_cast<uint32_t>(calcDistance(endloc, network.getStationLocation(lastTransitLeg.stationId)) / walkingSpeed);
+        leg.walkSeconds = walkDuration;
+        leg.arrivalTime = lastTransitLeg.arrivalTime + walkDuration; // Arrives after walk duration
+
+        path.addLeg(leg);
+    }
 }
 
 // Export the segment of a trip leg from legs[i] to legs[j] (inclusive) as CSV rows

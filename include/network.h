@@ -161,6 +161,9 @@ public:
     bool loadFromGTFS(const std::string& gtfsDir);
     void fetchRealtimeDelays();
     void buildPlatformParentVec();
+    void copyWalkingIndexFromQuery(const std::unordered_map<uint32_t, std::vector<WalkEdge>>& walkingIndex) {
+        this->walkingIndex = walkingIndex;
+    }
 
     void addStation(StationPtr& station) {
         uint32_t id = station->getId();
@@ -241,6 +244,7 @@ public:
     const std::vector<line_id>& getLinesServingStation(const uint32_t& stationId) const { return stations.at(stationId)->lines; }
     const std::vector<ScheduleEntry>& getLineSchedule(const line_id& lid) const { return lineSchedules[lid]; }
     const std::vector<TripStopIndex>& getTripStopIndex() const { return tripStopIndex; }
+    const std::unordered_map<uint32_t, std::vector<WalkEdge>>& getWalkingIndex() const { return walkingIndex; }
     const std::vector<std::vector<size_t>>& getNextTripScheduleIndex() const { return nextTripScheduleIndex; }
     const std::vector<std::unordered_map<uint32_t, std::vector<size_t>>>& getStationIndex() const { return stationIndex; }
     const ServiceInfo& getServiceInfo(const service_id sid) const { return serviceInfoVec[sid]; }
@@ -306,6 +310,10 @@ private:
     std::unique_ptr<CalendarDateExceptions> calendarExceptions;
     // Real-time delays: trip_id.id -> delay in seconds
     std::unordered_map<uint64_t, int32_t> realtimeDelays;
+
+    // Walking graph: station_id -> vector of (neighbor station_id, walk time seconds)
+    // Used only when MHDCore inits the network in multi-core mode
+    std::unordered_map<uint32_t, std::vector<WalkEdge>> walkingIndex;
 };
 
 #endif

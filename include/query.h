@@ -26,13 +26,14 @@ class Query {
 public:
     Query(Network& network, tm currentTime = { }, SearchPriority searchPriority = SearchPriority::QuickestTime,
             double walkingFactor = 1.3, uint32_t maxWalkingDistance = 1000, double walkingSpeed = 1.4,
-            std::ostream* outStream = nullptr)
+            std::ostream* outStream = nullptr, bool sharedWalkingEdges = false)
         : timeInfo(currentTime)
         , network(network)
         , maxWalkingDistance(maxWalkingDistance)
         , walkingSpeed(walkingSpeed)
         , walkingFactor(walkingFactor)
-        , searchPriority(searchPriority) {
+        , searchPriority(searchPriority)
+        , sharedWalkingEdges(sharedWalkingEdges) {
         if (isDefaultTm(timeInfo)) {
             time_t now = time(nullptr);
 #ifdef _WIN32
@@ -72,23 +73,54 @@ public:
 
         if constexpr (startIsString) {
             startId = network.lookupStationByName(std::string(start));
-            if (!startId) {
-                startId = network.lookupStationByGtfsId(std::string(start));
-            }
+            if (!startId) startId = network.lookupStationByGtfsId(std::string(start));
         } else {
             startId = network.getStationByLocation(start);
         }
 
         if constexpr (endIsString) {
             endId = network.lookupStationByName(std::string(end));
-            if (!endId) {
-                endId = network.lookupStationByGtfsId(std::string(end));
-            }
+            if (!endId) endId = network.lookupStationByGtfsId(std::string(end));
         } else {
             endId = network.getStationByLocation(end);
         }
-        network.getLogger().info("Looking up path from " + std::to_string(startId) + " to " + std::to_string(endId) + " at " + formatTime(getLookupTime())); 
+
+        network.getLogger().info("Looking up path from " + std::to_string(startId) + " to " + std::to_string(endId) + " at " + formatTime(getLookupTime()));
+
+        tm searchTimeInfo = timeInfo; 
+        
+        if constexpr (!startIsString) {
+            Location startLoc = network.getStationLocation(startId);
+            double dist = calcDistance(startLoc, start);
+            double walkingTime = dist / walkingSpeed;
+            if (walkingTime > 60){
+                searchTimeInfo.tm_sec += static_cast<int>(walkingTime);
+                
+                searchTimeInfo.tm_isdst = -1; 
+                std::mktime(&searchTimeInfo);
+                
+                timeInfo = searchTimeInfo;
+            }
+        }
+
         findPathsByStationIds(startId, endId, maxPaths);
+
+        if constexpr (!startIsString) {
+            timeInfo = searchTimeInfo; 
+            timeInfo.tm_sec -= static_cast<int>(calcDistance(network.getStationLocation(startId), start) / walkingSpeed);
+            std::mktime(&timeInfo);
+        }
+
+        if (!paths.empty()) {
+            if constexpr (!startIsString) {
+                Location startLoc = network.getStationLocation(startId);
+                addWalkingToPathStart(startLoc);
+            }
+            if constexpr (!endIsString) {
+                Location endLoc = network.getStationLocation(endId);
+                addWalkingToPathEnd(endLoc);
+            }
+        }
     }
 
     const Paths& getPaths() const { return paths; }
@@ -147,6 +179,7 @@ private:
     double walkingSpeed = 1.4; // in m/s
     double walkingFactor = 1.3; // Haversine multiplier (1.0 = straight line, 1.3 = realistic streets)
     SearchPriority searchPriority = SearchPriority::LeastTransfers;
+    bool sharedWalkingEdges = false;
 
     std::unordered_map<uint32_t, std::vector<WalkEdge>> walkingIndex;
 
@@ -156,12 +189,14 @@ private:
     int32_t getTransitScanWindowSeconds() const { return transitScanWindowSeconds; }
     int32_t getWeekSeconds() const { return weekSeconds; }
     int getMaxExpansions() const { return maxExpansions; }
-    const std::unordered_map<uint32_t, std::vector<WalkEdge>>& getWalkingIndex() const { return walkingIndex; }
+    // If sharedWalkingEdges is true, walking edges are stored in the Network and shared among all Queries to save memory, otherwise each Query builds its own walking index
+    const std::unordered_map<uint32_t, std::vector<WalkEdge>>& getWalkingIndex() const { return sharedWalkingEdges ? network.getWalkingIndex() : walkingIndex; }
 
     void buildWalkingIndex();
     void findPathsByStationIds(uint32_t startStationId, uint32_t endStationId, const int maxPaths = 3);
     bool exportTripSegmentCsv(std::ostream& output, const std::vector<PathLeg>& legs, size_t i, size_t j) const;
-
+    void addWalkingToPathEnd(Location endloc);
+    void addWalkingToPathStart(Location startloc);
     void printRouteHeader(std::ostream& output, int& pathCount, size_t stopCount) const;
     void printRouteWalkingLeg(std::ostream& output, const PathLeg& leg, const PathLeg& nextLeg) const;
     void printRouteTransitLeg(std::ostream& output, const PathLeg& leg, const PathLeg& nextLeg, bool isTransfer) const;

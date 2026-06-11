@@ -15,6 +15,7 @@ struct SchoolLookup {
     std::string school_venue;
     Location startLocation;
     Location endLocation;
+    std::tm actualArrival;
 };
 
 bool loadSchools(std::vector<SchoolLookup>& schools, const std::string& csvPath) {
@@ -35,14 +36,23 @@ bool loadSchools(std::vector<SchoolLookup>& schools, const std::string& csvPath)
         double lonStart = std::stod(std::string(parser.getField(line, "lon_start")));
         double latEnd = std::stod(std::string(parser.getField(line, "lat_end")));
         double lonEnd = std::stod(std::string(parser.getField(line, "lon_end")));
+        std::tm actualArrival = {};
+        actualArrival.tm_isdst = -1;
+        
+        std::string_view actualArrivalStr = parser.getField(line, "actual_arrival");
+        if (!actualArrivalStr.empty()) {
+            strptime(std::string(actualArrivalStr).c_str(), "%d.%m.%Y %H:%M", &actualArrival);
+        }
+        
         Location startLocation{latStart, lonStart};
         Location endLocation{latEnd, lonEnd};
-        schools.push_back({std::string(schoolName), std::string(schoolVenue), startLocation, endLocation});
+        schools.push_back({std::string(schoolName), std::string(schoolVenue), startLocation, endLocation, actualArrival});
     }
     return true;
 }
 
 void getTimeForQuery(const std::string& dateStr, const std::string& timeStr, std::tm& tm) {
+    tm.tm_isdst = -1;
     strptime((dateStr + " " + timeStr).c_str(), "%d.%m.%Y %H:%M", &tm);
 }
 
@@ -83,7 +93,7 @@ int main(int argc, char** argv) {
     timeArg = argv[4];
 
     bool onlineMode = true;
-    MHDCore core("MHD_NET", onlineMode, Logger::Level::NONE);
+    MHDCore core("MHD_NET", onlineMode, Logger::Level::NONE, true);
     if (!core.loadGTFS(gtfsDir, APIEndpoint::CUSTOM)) {
         return 2;
     }
@@ -93,13 +103,17 @@ int main(int argc, char** argv) {
         return 3;
     }
 
-    std::tm queryTm;
+    std::tm queryTm = {}; 
     getTimeForQuery(dateArg, timeArg, queryTm);
 
     std::vector<int> queryIDs;
     queryIDs.reserve(schools.size());
     for (size_t i = 0; i < schools.size(); ++i) {
-        int qid = core.newQuery(queryTm);
+        std::tm queryTmCur = queryTm;
+        if (schools[i].actualArrival.tm_year != 0) {
+            queryTmCur = schools[i].actualArrival;
+        }
+        int qid = core.newQuery(queryTmCur);
         queryIDs.push_back(qid);
     }
 
@@ -109,7 +123,11 @@ int main(int argc, char** argv) {
 
     #pragma omp parallel for shared(core, schools, queryIDs, queryTm) schedule(dynamic)
     for (int i = 0; i < totalSchools; ++i) {
-        findPathForSchool(core, schools[i], queryIDs[i], queryTm);
+        std::tm targetTime = queryTm;
+        if (schools[i].actualArrival.tm_year != 0) {
+            targetTime = schools[i].actualArrival;
+        }
+        findPathForSchool(core, schools[i], queryIDs[i], targetTime);
     }
 
     std::cerr << "All paths processed.\n";

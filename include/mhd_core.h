@@ -10,6 +10,7 @@ private:
     std::vector<Query> querries;
     std::string GTFSDir = "GTFS_DATA";
     APIEndpoint apiEndpoint = APIEndpoint::NONE;
+    bool multiCoreMode = false;
 
     static std::string formatTime(time_t time) {
         char buf[9];
@@ -22,8 +23,9 @@ public:
         Paths paths;
         std::string status;
     };
-    MHDCore(const std::string& networkName, bool onlineMode = false, Logger::Level logLevel = Logger::Level::NONE, std::ostream* loggerStream = &std::cerr)
-        : network(networkName, onlineMode) {
+    MHDCore(const std::string& networkName, bool onlineMode = false, Logger::Level logLevel = Logger::Level::NONE, bool multicore = false, std::ostream* loggerStream = &std::cerr)
+        : network(networkName, onlineMode)
+        , multiCoreMode(multicore) {
         network.getLogger().setLevel(logLevel);
         if (loggerStream) {
             network.getLogger().setOutput(*loggerStream);
