@@ -3,7 +3,6 @@
 
 #include "query.h"
 #include <ostream>
-#include <resolv.h>
 
 class MHDCore {
 private:
@@ -103,7 +102,7 @@ public:
                 }
                 lastSeenMinuteEpoch = midNormalizedToMinute;
 
-                tm midTime;
+                std::tm midTime = {}; 
                 localtime_r(&midNormalizedToMinute, &midTime);
 
                 q.setTimeInfo(midTime);

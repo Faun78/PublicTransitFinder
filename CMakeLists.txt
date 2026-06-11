@@ -120,4 +120,11 @@ add_executable(maso src/maso.cpp)
 target_link_libraries(maso PRIVATE mhd_core)
 
 add_executable(maso_para src/maso_para.cpp)
-target_link_libraries(maso_para PRIVATE mhd_core)
+find_package(OpenMP REQUIRED)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(maso_para PRIVATE OpenMP::OpenMP_CXX mhd_core)
+else()
+    message(WARNING "OpenMP not found, maso_para will be built without parallel support")
+    target_link_libraries(maso_para PRIVATE mhd_core)
+endif()
+

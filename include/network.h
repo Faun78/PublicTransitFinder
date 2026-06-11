@@ -212,6 +212,8 @@ public:
     }
 
     int32_t getRealtimeDelay(const trip_id& trip) const {
+        if (api != APIEndpoint::GOLEM)
+            return 0;
         auto it = realtimeDelays.find(trip.id);
         return (it != realtimeDelays.end()) ? it->second : 0;
     }

@@ -5,8 +5,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <future>
 #include <mutex>
+#include <omp.h>
 
 std::mutex g_logMutex;
 
@@ -46,17 +46,15 @@ void getTimeForQuery(const std::string& dateStr, const std::string& timeStr, std
     strptime((dateStr + " " + timeStr).c_str(), "%d.%m.%Y %H:%M", &tm);
 }
 
-void findPathForSchool(MHDCore& core, const SchoolLookup& school, std::tm queryTm) {
-    int threadSpecificQID = core.newQuery(queryTm, SearchPriority::QuickestTime, 1.3, 1000, 1.4);
-    
+void findPathForSchool(MHDCore& core, const SchoolLookup& school, int threadSpecificQID, std::tm queryTm) {
     auto result = core.lookUpArrival(threadSpecificQID, school.startLocation, school.endLocation, 1, queryTm);
-    
+
     if (result.status != "OK") {
         std::lock_guard<std::mutex> lock(g_logMutex);
         std::cerr << "No path found for " << school.schoolName << " at venue " << school.school_venue << "\n";
         return;
     }
-    
+
     std::string fileName = school.schoolName + "_" + school.school_venue + ".csv";
     std::ofstream outputFile(fileName);
     if (!outputFile.is_open()) {
@@ -64,10 +62,9 @@ void findPathForSchool(MHDCore& core, const SchoolLookup& school, std::tm queryT
         std::cerr << "Error opening output file: " << fileName << "\n";
         return;
     }
-    
+
     core.exportPathsToCsv(threadSpecificQID, outputFile, CsvExportMode::AllStops);
-    
-    // Thread-safe console log
+
     std::lock_guard<std::mutex> lock(g_logMutex);
     std::cout << "Path for " << school.schoolName << " at venue " << school.school_venue << " exported to " << fileName << "\n";
 }
@@ -86,32 +83,33 @@ int main(int argc, char** argv) {
     timeArg = argv[4];
 
     bool onlineMode = true;
-    MHDCore core("MHD_NET", onlineMode, Logger::Level::NONE); 
+    MHDCore core("MHD_NET", onlineMode, Logger::Level::NONE);
     if (!core.loadGTFS(gtfsDir, APIEndpoint::CUSTOM)) {
         return 2;
     }
-    
+
     std::vector<SchoolLookup> schools;
     if (!loadSchools(schools, lookupCsvPath)) {
         return 3;
     }
-    
+
     std::tm queryTm;
     getTimeForQuery(dateArg, timeArg, queryTm);
 
-    std::cout << "Processing " << schools.size() << " schools in parallel using adaptive binary search...\n";
-
-    std::vector<std::future<void>> futures;
-    futures.reserve(schools.size());
-
-    for (const auto& school : schools) {
-        futures.push_back(std::async(std::launch::async, [&core, school, queryTm]() {
-            findPathForSchool(core, school, queryTm);
-        }));
+    std::vector<int> queryIDs;
+    queryIDs.reserve(schools.size());
+    for (size_t i = 0; i < schools.size(); ++i) {
+        int qid = core.newQuery(queryTm);
+        queryIDs.push_back(qid);
     }
 
-    for (auto& fut : futures) {
-        fut.get();
+    std::cout << "Processing " << schools.size() << " schools in parallel using OpenMP...\n";
+
+    int totalSchools = static_cast<int>(schools.size());
+
+    #pragma omp parallel for shared(core, schools, queryIDs, queryTm) schedule(dynamic)
+    for (int i = 0; i < totalSchools; ++i) {
+        findPathForSchool(core, schools[i], queryIDs[i], queryTm);
     }
 
     std::cerr << "All paths processed.\n";

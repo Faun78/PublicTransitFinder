@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
     getTimeForQuery(dateArg, timeArg, queryTm);
     // Maybe we can make this parallel but now it is just a concept
     auto qID = core.newQuery(queryTm);
+    (void)qID; // silence unused
     for (const auto& school : schools) {
         findPathForSchool(core, school, queryTm);
     }
