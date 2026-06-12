@@ -73,32 +73,34 @@ public:
 
         if constexpr (startIsString) {
             startId = network.lookupStationByName(std::string(start));
-            if (!startId) startId = network.lookupStationByGtfsId(std::string(start));
+            if (!startId)
+                startId = network.lookupStationByGtfsId(std::string(start));
         } else {
             startId = network.getStationByLocation(start);
         }
 
         if constexpr (endIsString) {
             endId = network.lookupStationByName(std::string(end));
-            if (!endId) endId = network.lookupStationByGtfsId(std::string(end));
+            if (!endId)
+                endId = network.lookupStationByGtfsId(std::string(end));
         } else {
             endId = network.getStationByLocation(end);
         }
 
         network.getLogger().info("Looking up path from " + std::to_string(startId) + " to " + std::to_string(endId) + " at " + formatTime(getLookupTime()));
 
-        tm searchTimeInfo = timeInfo; 
-        
+        tm searchTimeInfo = timeInfo;
+
         if constexpr (!startIsString) {
             Location startLoc = network.getStationLocation(startId);
             double dist = calcDistance(startLoc, start);
             double walkingTime = dist / walkingSpeed;
-            if (walkingTime > 60){
+            if (walkingTime > 60) {
                 searchTimeInfo.tm_sec += static_cast<int>(walkingTime);
-                
-                searchTimeInfo.tm_isdst = -1; 
+
+                searchTimeInfo.tm_isdst = -1;
                 std::mktime(&searchTimeInfo);
-                
+
                 timeInfo = searchTimeInfo;
             }
         }
@@ -106,7 +108,7 @@ public:
         findPathsByStationIds(startId, endId, maxPaths);
 
         if constexpr (!startIsString) {
-            timeInfo = searchTimeInfo; 
+            timeInfo = searchTimeInfo;
             timeInfo.tm_sec -= static_cast<int>(calcDistance(network.getStationLocation(startId), start) / walkingSpeed);
             std::mktime(&timeInfo);
         }
@@ -126,7 +128,6 @@ public:
     const Paths& getPaths() const { return paths; }
     Paths takePaths() { return std::move(paths); }
 
-    uint8_t getDay() const { return static_cast<uint8_t>((timeInfo.tm_wday + 6) % 7); }
     uint32_t getLookupTime() const { return timeInfo.tm_hour * 3600 + timeInfo.tm_min * 60 + timeInfo.tm_sec; }
     uint32_t getLookupDate() const { return (1900 + timeInfo.tm_year) * 10000 + (timeInfo.tm_mon + 1) * 100 + timeInfo.tm_mday; }
     tm getTimeInfo() const { return timeInfo; }
@@ -162,7 +163,6 @@ private:
     // Lookup parameters and constants
     static constexpr uint32_t lookupSearchHorizonSeconds = 24u * 3600u;
     static constexpr int32_t transitScanWindowSeconds = 1200;
-    static constexpr int32_t weekSeconds = 7 * DateTimeUtils::DAYTIME;
     static constexpr int maxExpansions = 500000;
     static constexpr double degToMeters = 111320.0;
     static constexpr double degToRadians = 0.017453292519943295;
@@ -187,7 +187,6 @@ private:
     double getDegToRadians() const { return degToRadians; }
     uint32_t getLookupSearchHorizonSeconds() const { return lookupSearchHorizonSeconds; }
     int32_t getTransitScanWindowSeconds() const { return transitScanWindowSeconds; }
-    int32_t getWeekSeconds() const { return weekSeconds; }
     int getMaxExpansions() const { return maxExpansions; }
     // If sharedWalkingEdges is true, walking edges are stored in the Network and shared among all Queries to save memory, otherwise each Query builds its own walking index
     const std::unordered_map<uint32_t, std::vector<WalkEdge>>& getWalkingIndex() const { return sharedWalkingEdges ? network.getWalkingIndex() : walkingIndex; }

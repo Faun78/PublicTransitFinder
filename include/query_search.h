@@ -13,8 +13,7 @@ private:
         trip_id trip;
         uint32_t station;
         uint32_t entry_id;
-        uint32_t time;
-        uint8_t day;
+        uint32_t elapsed_seconds;
         uint8_t changeNumber;
         uint8_t walkSegments;
         bool isWait = false;
@@ -29,8 +28,7 @@ private:
         uint32_t entry_id;
         uint32_t station;
         trip_id trip;
-        uint32_t arrival_time;
-        uint8_t day;
+        uint32_t elapsed_seconds;
         uint32_t prev;
     };
 
@@ -48,19 +46,16 @@ private:
             int32_t earliestDeparture, int32_t latestDeparture);
     void processTripExpansion(const PQEntry& cur,
             std::vector<PathEntry>& pathEntries, MinHeap& pq,
-            uint8_t baseDay, const trip_id& trip,
+            uint32_t baseQueryTime, const ScheduleEntry& board,
             uint32_t boardServiceSec, int32_t selectedDep,
-            size_t startIdx, const std::vector<ScheduleEntry>& sched,
-            uint8_t currentStopSeq);
+            size_t startIdx, const std::vector<ScheduleEntry>& sched);
     void expandTransit(const PQEntry& cur,
-            std::vector<PathEntry>& pathEntries, MinHeap& pq,
-            uint8_t baseDay);
+            std::vector<PathEntry>& pathEntries, MinHeap& pq);
     std::optional<PQEntry> expandOneStep(
             MinHeap& pq,
             std::vector<PathEntry>& pathEntries,
             std::vector<uint32_t>& earliestArrival,
-            uint8_t baseDay, uint32_t targetStation,
-            std::vector<uint32_t>& lastWaitCache);
+            uint32_t targetStation, std::vector<uint32_t>& lastWaitCache);
 
 public:
     QuerySearch(Query& query)

@@ -5,34 +5,26 @@
 #include <unordered_set>
 
 uint32_t QuerySearch::applyRealtimeDelay(uint32_t arrivalTime, int32_t delaySeconds) {
-    if (!delaySeconds)
-        return arrivalTime;
-
     int64_t adjusted = static_cast<int64_t>(arrivalTime) + delaySeconds;
     if (adjusted < 0)
-        adjusted += DateTimeUtils::DAYTIME;
-    else if (adjusted >= DateTimeUtils::DAYTIME)
-        adjusted %= DateTimeUtils::DAYTIME;
+        return 0;
     return static_cast<uint32_t>(adjusted);
 }
 
 bool QuerySearch::PQComparator::operator()(const PQEntry& a, const PQEntry& b) const noexcept {
     if (priority == SearchPriority::QuickestTime) {
-        if (a.day != b.day)
-            return a.day > b.day;
-        if (a.time != b.time)
-            return a.time > b.time;
+        if (a.elapsed_seconds != b.elapsed_seconds)
+            return a.elapsed_seconds > b.elapsed_seconds;
         if (a.changeNumber != b.changeNumber)
             return a.changeNumber > b.changeNumber;
         return a.walkSegments > b.walkSegments;
     }
+    // Least Transfers Mode
     if (a.changeNumber != b.changeNumber)
         return a.changeNumber > b.changeNumber;
     if (a.walkSegments != b.walkSegments)
         return a.walkSegments > b.walkSegments;
-    if (a.day != b.day)
-        return a.day > b.day;
-    return a.time > b.time;
+    return a.elapsed_seconds > b.elapsed_seconds;
 }
 
 Path QuerySearch::buildPath(const PathEntry& endEntry,
@@ -49,31 +41,35 @@ Path QuerySearch::buildPath(const PathEntry& endEntry,
     }
     std::reverse(routeIds.begin(), routeIds.end());
     auto path = Path();
+
+    uint32_t baseTimeSec = query.getLookupTime();
+    uint32_t baseDate = query.getLookupDate();
+
     for (size_t i = 0; i < routeIds.size(); ++i) {
         const auto& current = pathEntries[routeIds[i]];
         PathLeg leg { };
         leg.stationId = current.station;
-        leg.arrivalTime = current.arrival_time;
-        // Calculate arrival date based on the day offset from the lookup date
-        leg.arrivalDate = DateTimeUtils::advanceDate(query.getLookupDate(), static_cast<int>((current.day + 7u - query.getDay()) % 7u));
+
+        // Reconstruct absolute timestamp safely
+        uint64_t totalAbsSeconds = static_cast<uint64_t>(baseTimeSec) + current.elapsed_seconds;
+        leg.arrivalTime = static_cast<uint32_t>(totalAbsSeconds % DateTimeUtils::DAYTIME);
+        leg.arrivalDate = DateTimeUtils::advanceDate(baseDate, static_cast<int>(totalAbsSeconds / DateTimeUtils::DAYTIME));
+
         if (i + 1 >= routeIds.size()) {
-            // Last leg, no departure time or line
             path.addLeg(leg);
             continue;
         }
+
         const auto& next = pathEntries[routeIds[i + 1]];
         leg.line = next.trip.line;
         leg.trip = next.trip;
         // kNoLine -> walking leg
         if (next.trip.line == kNoLine) {
             leg.isWalk = true;
-            uint32_t nextArr = next.arrival_time;
-            uint32_t curArr = current.arrival_time;
-            // Handle midnight wrap for walking legs
-            leg.walkSeconds = (nextArr >= curArr) ? (nextArr - curArr) : (DateTimeUtils::DAYTIMEu - curArr + nextArr);
-            leg.departureTime = curArr;
+            leg.walkSeconds = next.elapsed_seconds - current.elapsed_seconds;
+            leg.departureTime = leg.arrivalTime;
         } else {
-            uint32_t scheduledDep = current.arrival_time;
+            uint32_t scheduledDep = leg.arrivalTime;
             if (next.trip.line < (line_id)tsIdx.size()) {
                 // We detect lines but sometimes individual trips have special schedules so look up in the trip index for the exact departure time
                 auto sit = tsIdx[next.trip.line].find(StopKey { next.trip, current.station });
@@ -123,16 +119,12 @@ void QuerySearch::expandWalking(const PQEntry& cur,
     for (const auto& edge : it->second) {
         if (edge.station == cur.station || edge.seconds == 0)
             continue;
-        uint32_t newTime = cur.time + edge.seconds;
-        uint8_t nd = cur.day;
-        // Handle midnight wrap
-        if (newTime >= DateTimeUtils::DAYTIME) {
-            newTime -= DateTimeUtils::DAYTIME;
-            nd = (nd + 1) % 7;
-        }
-        PathEntry p { (uint32_t)pathEntries.size(), edge.station, trip_id { }, newTime, nd, cur.entry_id };
+
+        uint32_t nextElapsed = cur.elapsed_seconds + edge.seconds;
+        PathEntry p { (uint32_t)pathEntries.size(), edge.station, trip_id { }, nextElapsed, cur.entry_id };
         pathEntries.push_back(p);
-        pq.push(PQEntry { trip_id { }, edge.station, p.entry_id, newTime, nd, (uint8_t)(cur.changeNumber + 1), (uint8_t)(cur.walkSegments + 1), false });
+        pq.push(PQEntry { trip_id { }, edge.station, p.entry_id, nextElapsed,
+                (uint8_t)(cur.changeNumber + 1), (uint8_t)(cur.walkSegments + 1), false });
     }
 }
 
@@ -144,9 +136,9 @@ std::optional<int32_t> QuerySearch::findBestDeparture(const trip_id& trip, uint3
     int32_t realtimeDelay = 0;
     if (query.network.isOnlineMode())
         realtimeDelay = query.network.getRealtimeDelay(trip);
-    // The trip might be active on the previous, current, or next as GTFS stores overlap of the day at midnight,
-    // so check all three service days for possible departures within the allowed time window
-    for (int dayShift = -1; dayShift <= 1; ++dayShift) {
+
+    int checkRange = 1 + static_cast<int>(boardServiceSec / DateTimeUtils::DAYTIME);
+    for (int dayShift = -checkRange; dayShift <= 1; ++dayShift) {
         int32_t serviceStart = curDayStart + dayShift * DateTimeUtils::DAYTIME;
         int32_t depCandidate = serviceStart + static_cast<int32_t>(boardServiceSec);
         if (depCandidate < earliestDeparture || depCandidate > latestDeparture)
@@ -170,64 +162,52 @@ std::optional<int32_t> QuerySearch::findBestDeparture(const trip_id& trip, uint3
 }
 
 void QuerySearch::processTripExpansion(const PQEntry& cur,
-        std::vector<PathEntry>& pathEntries, MinHeap& pq,
-        uint8_t baseDay, const trip_id& trip,
+        std::vector<QuerySearch::PathEntry>& pathEntries, MinHeap& pq,
+        uint32_t baseQueryTime, const ScheduleEntry& board,
         uint32_t boardServiceSec, int32_t selectedDep,
-        size_t startIdx, const std::vector<ScheduleEntry>& sched,
-        uint8_t currentStopSeq) {
-    // Loop through the schedule entries and find our trip's next stops to expand to
+        size_t startIdx, const std::vector<ScheduleEntry>& sched) {
+
+    // Expand to onward stops
     for (size_t di = startIdx; di < sched.size(); ++di) {
         const ScheduleEntry& dest = sched[di];
-        if (dest.trip != trip)
+        if (dest.trip != board.trip)
             continue;
-        // Only consider stops that are after the boarding stop in the trip sequence
-        if (dest.stop_sequence <= currentStopSeq)
+        if (dest.stop_sequence <= board.stop_sequence)
             continue;
-        uint32_t destServiceSec = dest.day_offset * DateTimeUtils::DAYTIMEu + dest.arrival_time;
+
+        uint32_t destServiceSec = dest.day_offset * DateTimeUtils::DAYTIME + dest.arrival_time;
         if (destServiceSec < boardServiceSec)
             continue;
-        // arr is calculated as the actual departure time from the boarding stop plus the scheduled time
-        // difference between the boarding stop and the destination stop
-        int32_t arr = selectedDep + static_cast<int32_t>(destServiceSec - boardServiceSec);
 
-        int32_t delay = 0;
-        if (query.network.isOnlineMode())
-            delay = query.network.getRealtimeDelay(trip);
-        uint32_t nextArr = QuerySearch::applyRealtimeDelay(arr, delay);
-        arr += delay;
-        int32_t arrWeek = arr % query.getWeekSeconds();
-        if (arrWeek < 0)
-            arrWeek += query.getWeekSeconds();
-        // Calculate the arrival day and time considering the week and day wraps
-        uint8_t arrDay = (uint8_t)((baseDay + (arrWeek / DateTimeUtils::DAYTIME)) % 7);
+        int32_t arrAbs = selectedDep + static_cast<int32_t>(destServiceSec - boardServiceSec);
+        int32_t delay = query.network.isOnlineMode() ? query.network.getRealtimeDelay(board.trip) : 0;
+        arrAbs += delay;
+
+        if (arrAbs < static_cast<int32_t>(baseQueryTime))
+            continue;
+        uint32_t nextElapsed = static_cast<uint32_t>(arrAbs - baseQueryTime);
 
         uint8_t newChange = cur.changeNumber;
-        if (cur.trip != trip && cur.trip.line != kNoLine && trip.line != kNoLine)
+        if (cur.trip != board.trip && cur.trip.line != kNoLine)
             ++newChange;
-        PathEntry p { (uint32_t)pathEntries.size(), dest.station_id, trip, nextArr, arrDay, cur.entry_id };
+
+        PathEntry p { (uint32_t)pathEntries.size(), dest.station_id, board.trip, nextElapsed, cur.entry_id };
         pathEntries.push_back(p);
-        pq.push(PQEntry { trip, dest.station_id, p.entry_id, nextArr, arrDay, newChange, cur.walkSegments, false });
+        pq.push(PQEntry { board.trip, dest.station_id, p.entry_id, nextElapsed, newChange, cur.walkSegments, false });
     }
 }
 
 void QuerySearch::expandTransit(const PQEntry& cur,
-        std::vector<PathEntry>& pathEntries, MinHeap& pq,
-        uint8_t baseDay) {
-    // Check if we are in the max search horizon compared to the original query time
-    uint32_t curAbsFromBase = static_cast<uint32_t>((cur.day - baseDay + 7) % 7) * DateTimeUtils::DAYTIMEu + cur.time;
-    uint32_t baseQueryTime = query.getLookupTime();
-    uint32_t elapsedFromQuery = (curAbsFromBase >= baseQueryTime)
-            ? curAbsFromBase - baseQueryTime
-            : curAbsFromBase + DateTimeUtils::DAYTIMEu - baseQueryTime;
-    if (elapsedFromQuery > query.getLookupSearchHorizonSeconds())
+        std::vector<QuerySearch::PathEntry>& pathEntries, MinHeap& pq) {
+    if (cur.elapsed_seconds > query.getLookupSearchHorizonSeconds())
         return;
-    // apply transfer time and calculate the earliest and latest departure times for the next trip based on scan window
-    const int32_t curDayStart = static_cast<int32_t>(((cur.day - baseDay + 7) % 7) * DateTimeUtils::DAYTIME);
-    const int curDayOffset = static_cast<int>((cur.day - baseDay + 7) % 7);
-    int32_t earliestDeparture = static_cast<int32_t>(curAbsFromBase);
+
+    // Shift window relative to base lookup midnight context
+    uint32_t baseQueryTime = query.getLookupTime();
+    int32_t earliestDeparture = static_cast<int32_t>(baseQueryTime + cur.elapsed_seconds);
     if (!cur.isWait && cur.entry_id != 0)
         earliestDeparture += static_cast<int32_t>(query.getDefaultTransferTime());
-    const int32_t latestDeparture = earliestDeparture + query.getTransitScanWindowSeconds();
+    int32_t latestDeparture = earliestDeparture + query.getTransitScanWindowSeconds();
 
     const auto& stationIdx = query.network.getStationIndex();
     const auto& nextTripIdx = query.network.getNextTripScheduleIndex();
@@ -250,19 +230,17 @@ void QuerySearch::expandTransit(const PQEntry& cur,
             continue;
         // When we find the station in the index, we get a list of schedule indices
         // corresponding to trips that stop at the station, loop through those to find valid trips to board
-        const auto& indices = stIt->second;
-        for (size_t boardIndex : indices) {
+        for (size_t boardIndex : stIt->second) {
             const ScheduleEntry& board = sched[boardIndex];
             if (board.trip == cur.trip)
                 continue;
-
             if (cur.trip.line != kNoLine && cur.trip.line == board.trip.line)
                 continue;
-            // look for best departure over midnight and week wrap
-            uint32_t boardServiceSec = board.day_offset * DateTimeUtils::DAYTIMEu + board.arrival_time;
-            auto selectedDep = findBestDeparture(board.trip, boardServiceSec,
-                    curDayStart, curDayOffset, earliestDeparture, latestDeparture);
 
+            uint32_t boardServiceSec = board.day_offset * DateTimeUtils::DAYTIME + board.arrival_time;
+
+            // Pass constant context targets relative to day 0 references
+            auto selectedDep = findBestDeparture(board.trip, boardServiceSec, 0, 0, earliestDeparture, latestDeparture);
             if (!selectedDep)
                 continue;
             // We have the boarding trip and departure time, now find the corresponding arrival at the destination stop to expand to
@@ -272,8 +250,8 @@ void QuerySearch::expandTransit(const PQEntry& cur,
             if (startIdx >= sched.size())
                 continue;
             // Now we can expand to the next stops of the boarding trip and add them to the queue
-            processTripExpansion(cur, pathEntries, pq, baseDay, board.trip,
-                    boardServiceSec, *selectedDep, startIdx, sched, board.stop_sequence);
+            processTripExpansion(cur, pathEntries, pq, baseQueryTime, board,
+                    boardServiceSec, *selectedDep, startIdx, sched);
         }
     }
 }
@@ -282,42 +260,33 @@ std::optional<QuerySearch::PQEntry> QuerySearch::expandOneStep(
         MinHeap& pq,
         std::vector<PathEntry>& pathEntries,
         std::vector<uint32_t>& earliestArrival,
-        uint8_t baseDay, uint32_t targetStation,
-        std::vector<uint32_t>& lastWaitCache) {
+        uint32_t targetStation, std::vector<uint32_t>& lastWaitCache) {
     // Inner loop -> expand entries until we find one that is valid to expand
     while (!pq.empty()) {
         PQEntry cur = pq.top();
         pq.pop();
-        uint32_t absTime = DateTimeUtils::toAbsSeconds(baseDay, cur.day, cur.time);
-        // If we are optimizing for quickest time, we can prune entries that arrive later than the best known arrival for that station and day
-        // however we cannot do this in the least transfers mode -> this explodes the search space and leads to much longer search times
         if (query.getSearchPriority() == SearchPriority::QuickestTime && !cur.isWait && cur.station != targetStation) {
-            uint32_t idx = cur.station * 7u + (uint32_t)cur.day;
-            uint32_t& inserted = earliestArrival[idx];
-            if (inserted <= absTime)
+            uint32_t& currentBest = earliestArrival[cur.station];
+            if (currentBest <= cur.elapsed_seconds)
                 continue;
-            inserted = absTime;
+            currentBest = cur.elapsed_seconds;
         }
         if (cur.changeNumber > query.getMaxTransfers())
             continue;
 
         expandWalking(cur, pathEntries, pq);
-        expandTransit(cur, pathEntries, pq, baseDay);
-        uint32_t origArrivalAbsTime = DateTimeUtils::toAbsSeconds(baseDay, pathEntries[cur.entry_id].day, pathEntries[cur.entry_id].arrival_time);
-        if (absTime < origArrivalAbsTime + DateTimeUtils::DAYTIMEu) {
-            // Schedule new wait step in the same station if it does not cause more than 24h difference from origo arrival
+        expandTransit(cur, pathEntries, pq);
+
+        // Schedule next incremental waiting step safely inside bounds
+        uint32_t origElapsed = pathEntries[cur.entry_id].elapsed_seconds;
+        if (cur.elapsed_seconds < origElapsed + DateTimeUtils::DAYTIME) {
             PQEntry waitEntry = cur;
-            waitEntry.time = cur.time + query.getDefaultWaitingTime(); // Default waiting time to expand the search window
-            if (waitEntry.time >= DateTimeUtils::DAYTIMEu) {
-                waitEntry.time -= DateTimeUtils::DAYTIMEu;
-                waitEntry.day = (waitEntry.day + 1) % 7;
-            }
+            waitEntry.elapsed_seconds += query.getDefaultWaitingTime();
             waitEntry.isWait = true;
-            uint32_t waitIdx = waitEntry.station * 7u + (uint32_t)waitEntry.day;
             // cache it so we do not schedule multiple wait steps from diffrent arrivals in the same station
-            uint32_t waitCache = waitEntry.time / query.getDefaultWaitingTime();
-            if (waitIdx < lastWaitCache.size() && lastWaitCache[waitIdx] != waitCache) {
-                lastWaitCache[waitIdx] = waitCache;
+            uint32_t waitCache = waitEntry.elapsed_seconds / query.getDefaultWaitingTime();
+            if (lastWaitCache[cur.station] != waitCache) {
+                lastWaitCache[cur.station] = waitCache;
                 pq.push(waitEntry);
             }
         }
@@ -367,64 +336,42 @@ void QuerySearch::buildWalkingIndex() {
     }
 }
 
-void QuerySearch::findPathsByStationIds(uint32_t startStationId,
-        uint32_t endStationId, const int maxPaths) {
+void QuerySearch::findPathsByStationIds(uint32_t startStationId, uint32_t endStationId, const int maxPaths) {
     int pathCount = 0;
-    tm timeInfoCopy = query.timeInfo;
-    tm now = { };
-    time_t now_t = time(nullptr);
-#ifdef _WIN32
-    localtime_s(&now, &now_t);
-#else
-    localtime_r(&now_t, &now);
-#endif
-    mktime(&timeInfoCopy);
-    // Check only if the lookup time is within 6 hours as we do not want to fetch realtime if not needed
-    if (std::difftime(mktime(&timeInfoCopy), now_t) < 6 * 3600) {
-        query.network.fetchRealtimeDelays();
-    }
-    // If either start or end station is invalid, return immediately
     if (!startStationId || !endStationId)
         return;
     // Return immediately if start and end stations are the same, with a single-leg path
     if (startStationId == endStationId) {
         auto path = Path();
-        PathLeg leg { };
-        leg.stationId = startStationId;
-        leg.arrivalTime = query.getLookupTime();
-        leg.arrivalDate = query.getLookupDate();
+        PathLeg leg { startStationId, query.getLookupTime(), query.getLookupDate() };
         path.addLeg(leg);
-        query.paths.clear();
-        query.paths.push_back(path);
+        query.paths = { path };
         query.printRoute(query.paths.back(), pathCount, maxPaths);
         return;
     }
 
     const auto& tsIdx = query.network.getTripStopIndex();
-
     MinHeap pq(PQComparator { query.getSearchPriority() });
     std::vector<PathEntry> pathEntries;
-    // Preallocate path entries to avoid frequent realloc
-    pathEntries.reserve(1000000);
+    pathEntries.reserve(500000);
 
     uint32_t maxStationId = query.network.getMaxStationId();
-    // For each station and day, store the earliest arrival time found so far to prune worse arrivals
-    std::vector<uint32_t> earliestArrival((maxStationId + 1u) * 7u, std::numeric_limits<uint32_t>::max());
+    std::vector<uint32_t> earliestArrival(maxStationId + 1, std::numeric_limits<uint32_t>::max());
+    // Cache to avoid scheduling multiple wait steps for the same station
+    std::vector<uint32_t> lastWaitCache(maxStationId + 1, std::numeric_limits<uint32_t>::max());
 
     query.paths.clear();
-    // Cache to avoid scheduling multiple wait steps for the same station
-    std::vector<uint32_t> lastWaitCache((maxStationId + 1u) * 7u, std::numeric_limits<uint32_t>::max());
-    // Start with the initial station and time
-    pathEntries.push_back({ 0, startStationId, trip_id { }, query.getLookupTime(), query.getDay(), std::numeric_limits<uint32_t>::max() });
-    pq.push(PQEntry { trip_id { }, startStationId, 0, query.getLookupTime(), query.getDay(), 0, 0, false });
 
-    const uint8_t baseDay = query.getDay();
+    // Start node has 0 elapsed seconds
+    pathEntries.push_back({ 0, startStationId, trip_id { }, 0, std::numeric_limits<uint32_t>::max() });
+    pq.push(PQEntry { trip_id { }, startStationId, 0, 0, 0, 0, false });
+
     std::unordered_set<uint64_t> seenPathFingerprints;
     int expansions = 0;
     // Main search -> expand paths until we find enough paths or reach the expansion limit so we do not run indefinitely
     while (!pq.empty() && expansions < Query::maxExpansions && (int)query.paths.size() < maxPaths) {
         // Find first valid node to expand
-        auto stepped = expandOneStep(pq, pathEntries, earliestArrival, baseDay, endStationId, lastWaitCache);
+        auto stepped = expandOneStep(pq, pathEntries, earliestArrival, endStationId, lastWaitCache);
         if (!stepped)
             continue;
         ++expansions;

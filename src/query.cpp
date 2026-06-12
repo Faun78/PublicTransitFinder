@@ -15,17 +15,16 @@ void Query::writeTripSegmentCsvRow(std::ostream& output, const std::string& stat
            << location.longitude << ',' << (transferFlag ? 1 : 0) << '\n';
 }
 void Query::buildWalkingIndex() {
-    network.getLogger().info("Building walking index for " + std::string( sharedWalkingEdges ? "shared" : "query-specific" )+ " walking edges...");
+    network.getLogger().info("Building walking index for " + std::string(sharedWalkingEdges ? "shared" : "query-specific") + " walking edges...");
     if (sharedWalkingEdges) {
         if (network.getWalkingIndex().empty()) {
             network.getLogger().info("Building shared walking index...");
             QuerySearch(*this).buildWalkingIndex();
             network.copyWalkingIndexFromQuery(this->walkingIndex);
-            network.getLogger().info("Shared walking index successfully synchronized with " + 
-                                     std::to_string(network.getWalkingIndex().size()) + " stations.");
+            network.getLogger().info("Shared walking index successfully synchronized with " + std::to_string(network.getWalkingIndex().size()) + " stations.");
             this->walkingIndex.clear();
         }
-    }else{
+    } else {
         QuerySearch(*this).buildWalkingIndex();
     }
 }
@@ -78,8 +77,9 @@ void Query::printRouteDestinationLeg(std::ostream& output) const {
 
 // Get format in HH:MM
 std::string Query::formatTime(uint32_t seconds) {
+    uint32_t normalizedSeconds = seconds % DateTimeUtils::DAYTIME;
     char buf[16];
-    std::snprintf(buf, sizeof(buf), "%02u:%02u", seconds / 3600, (seconds % 3600) / 60);
+    std::snprintf(buf, sizeof(buf), "%02u:%02u", normalizedSeconds / 3600, (normalizedSeconds % 3600) / 60);
     return buf;
 }
 
@@ -189,7 +189,7 @@ void Query::addWalkingToPathStart(Location startloc) {
         // Generate a staionID for this lookup if we don't have a valid start station
         uint32_t id = network.getStationByLocation(startloc);
         Location loc = network.getStationLocation(id);
-        if (calcDistance(loc, startloc) < walkingSpeed * 60) { 
+        if (calcDistance(loc, startloc) < walkingSpeed * 60) {
             continue;
         }
         mutex_local.lock();
@@ -217,12 +217,13 @@ void Query::addWalkingToPathStart(Location startloc) {
 
 void Query::addWalkingToPathEnd(Location endloc) {
     for (auto& path : paths) {
-        if (path.getLegs().empty()) continue;
+        if (path.getLegs().empty())
+            continue;
 
         const PathLeg& lastTransitLeg = path.getLegs().back();
         uint32_t id = network.getStationByLocation(endloc);
         Location loc = network.getStationLocation(id);
-        if (calcDistance(loc, endloc) < walkingSpeed * 60) { 
+        if (calcDistance(loc, endloc) < walkingSpeed * 60) {
             continue;
         }
         mutex_local.lock();
@@ -235,8 +236,8 @@ void Query::addWalkingToPathEnd(Location endloc) {
         leg.isWalk = true;
         leg.stationId = count;
         leg.arrivalDate = lastTransitLeg.arrivalDate;
-        leg.departureTime = lastTransitLeg.arrivalTime; 
-        
+        leg.departureTime = lastTransitLeg.arrivalTime;
+
         uint32_t walkDuration = static_cast<uint32_t>(calcDistance(endloc, network.getStationLocation(lastTransitLeg.stationId)) / walkingSpeed);
         leg.walkSeconds = walkDuration;
         leg.arrivalTime = lastTransitLeg.arrivalTime + walkDuration; // Arrives after walk duration
@@ -272,6 +273,12 @@ bool Query::exportTripSegmentCsv(std::ostream& output, const std::vector<PathLeg
     // Lookup the schedule for this line and apply any realtime delay
     const auto& schedule = network.getLineSchedule(lid);
     int32_t delay = network.getRealtimeDelay(leg.trip);
+
+    if (schedule[idxB].trip != leg.trip || schedule[idxA].trip != leg.trip)
+        return false;
+
+    uint32_t boardBaseOffset = schedule[idxB].day_offset + (schedule[idxB].arrival_time / DateTimeUtils::DAYTIME);
+
     const auto& nextForLine = network.getNextTripScheduleIndex();
     if (lid < nextForLine.size()) {
         const auto& nextIdx = nextForLine[lid];
@@ -279,8 +286,15 @@ bool Query::exportTripSegmentCsv(std::ostream& output, const std::vector<PathLeg
         // Iterate through the schedule from boarding to final stop
         while (station < schedule.size()) {
             const ScheduleEntry& se = schedule[station];
+            if (se.trip != leg.trip)
+                break;
+
             uint32_t arrTime = QuerySearch::applyRealtimeDelay(se.arrival_time, delay);
-            uint32_t arrDate = leg.arrivalDate + se.day_offset;
+
+            uint32_t currentStopOffset = se.day_offset + (se.arrival_time / DateTimeUtils::DAYTIME);
+            int32_t daysFromBoarding = static_cast<int32_t>(currentStopOffset) - static_cast<int32_t>(boardBaseOffset);
+            uint32_t arrDate = DateTimeUtils::advanceDate(leg.arrivalDate, daysFromBoarding);
+
             const Location& loc = network.getStationLocation(se.station_id);
             bool transferFlag = false;
             if (se.station_id == leg.stationId && isTransferRow(legs, i))
@@ -293,7 +307,7 @@ bool Query::exportTripSegmentCsv(std::ostream& output, const std::vector<PathLeg
             if (station >= nextIdx.size())
                 break;
             size_t n = nextIdx[station];
-            if (n == station)
+            if (n == station || schedule[n].trip != leg.trip)
                 break;
             station = n;
         }
@@ -304,8 +318,14 @@ bool Query::exportTripSegmentCsv(std::ostream& output, const std::vector<PathLeg
     // YES GTFS can change the schedule to other stations between stops of the same line.
     for (size_t station = idxB; station <= idxA && station < schedule.size(); ++station) {
         const ScheduleEntry& se = schedule[station];
+        if (se.trip != leg.trip)
+            continue;
+
         uint32_t arrTime = QuerySearch::applyRealtimeDelay(se.arrival_time, delay);
-        uint32_t arrDate = leg.arrivalDate + se.day_offset;
+
+        uint32_t currentStopOffset = se.day_offset + (se.arrival_time / DateTimeUtils::DAYTIME);
+        int32_t daysFromBoarding = static_cast<int32_t>(currentStopOffset) - static_cast<int32_t>(boardBaseOffset);
+        uint32_t arrDate = DateTimeUtils::advanceDate(leg.arrivalDate, daysFromBoarding);
         const Location& loc = network.getStationLocation(se.station_id);
         bool transferFlag = false;
         if (se.station_id == leg.stationId && isTransferRow(legs, i))
