@@ -3,6 +3,7 @@
 #include <limits>
 #include <optional>
 #include <unordered_set>
+#include <cmath>
 
 uint32_t QuerySearch::applyRealtimeDelay(uint32_t arrivalTime, int32_t delaySeconds) {
     int64_t adjusted = static_cast<int64_t>(arrivalTime) + delaySeconds;
@@ -42,20 +43,15 @@ Path QuerySearch::buildPath(const PathEntry& endEntry,
     std::reverse(routeIds.begin(), routeIds.end());
     auto path = Path();
 
-    uint32_t baseTimeSec = query.getLookupTime();
-    uint32_t baseDate = query.getLookupDate();
-
     for (size_t i = 0; i < routeIds.size(); ++i) {
         const auto& current = pathEntries[routeIds[i]];
         PathLeg leg { };
         leg.stationId = current.station;
-
-        // Reconstruct absolute timestamp safely
-        uint64_t totalAbsSeconds = static_cast<uint64_t>(baseTimeSec) + current.elapsed_seconds;
-        leg.arrivalTime = static_cast<uint32_t>(totalAbsSeconds % DateTimeUtils::DAYTIME);
-        leg.arrivalDate = DateTimeUtils::advanceDate(baseDate, static_cast<int>(totalAbsSeconds / DateTimeUtils::DAYTIME));
+        leg.elapsedArrival = current.elapsed_seconds;
 
         if (i + 1 >= routeIds.size()) {
+            // Koncová stanice trasy nedisponuje odjezdem
+            leg.elapsedDeparture = current.elapsed_seconds;
             path.addLeg(leg);
             continue;
         }
@@ -67,19 +63,56 @@ Path QuerySearch::buildPath(const PathEntry& endEntry,
         if (next.trip.line == kNoLine) {
             leg.isWalk = true;
             leg.walkSeconds = next.elapsed_seconds - current.elapsed_seconds;
-            leg.departureTime = leg.arrivalTime;
+            leg.elapsedDeparture = current.elapsed_seconds;
+            leg.elapsedArrival = next.elapsed_seconds; 
         } else {
-            uint32_t scheduledDep = leg.arrivalTime;
+            uint32_t elapsedDeparture = current.elapsed_seconds;
             if (next.trip.line < (line_id)tsIdx.size()) {
                 // We detect lines but sometimes individual trips have special schedules so look up in the trip index for the exact departure time
                 auto sit = tsIdx[next.trip.line].find(StopKey { next.trip, current.station });
-                if (sit != tsIdx[next.trip.line].end())
-                    scheduledDep = query.network.getLineSchedule(next.trip.line)[sit->second].arrival_time;
+                if (sit != tsIdx[next.trip.line].end()) {
+                    const auto& sched = query.network.getLineSchedule(next.trip.line);
+                    const auto& schedEntry = sched[sit->second];
+                    
+                    uint32_t boardServiceSec = schedEntry.day_offset * DateTimeUtils::DAYTIME + schedEntry.arrival_time;
+                    
+                    uint32_t baseTimeSec = query.getLookupTime();
+                    int32_t earliestDep = static_cast<int32_t>(baseTimeSec + current.elapsed_seconds);
+                    if (i > 0 && !(pathEntries[routeIds[i]].trip.line == kNoLine)) {
+                        earliestDep += static_cast<int32_t>(query.getDefaultTransferTime());
+                    }
+
+                    int32_t selectedDep = std::numeric_limits<int32_t>::max();
+                    int32_t realtimeDelay = query.network.isOnlineMode() ? query.network.getRealtimeDelay(next.trip) : 0;
+
+                    for (int dayShift = -1; dayShift <= 2; ++dayShift) {
+                        int32_t depCandidate = dayShift * DateTimeUtils::DAYTIME + static_cast<int32_t>(boardServiceSec);
+                        if (depCandidate + realtimeDelay >= earliestDep) {
+                            if (depCandidate < selectedDep) {
+                                int32_t totalSecFromBase = depCandidate;
+                                int32_t daysFromLookup = totalSecFromBase / static_cast<int32_t>(DateTimeUtils::DAYTIME);
+                                if (totalSecFromBase < 0 && totalSecFromBase % DateTimeUtils::DAYTIME != 0) {
+                                    daysFromLookup--;
+                                }
+                                uint32_t depDate = DateTimeUtils::advanceDate(query.getLookupDate(), daysFromLookup);
+                                
+                                if (query.network.isTripActiveOnDate(next.trip, depDate)) {
+                                    selectedDep = depCandidate;
+                                }
+                            }
+                        }
+                    }
+
+                    if (selectedDep != std::numeric_limits<int32_t>::max()) {
+                        elapsedDeparture = static_cast<uint32_t>(selectedDep - static_cast<int32_t>(baseTimeSec));
+                    }
+                }
             }
+
             if (query.network.isOnlineMode()) {
                 leg.delaySeconds = query.network.getRealtimeDelay(next.trip);
             }
-            leg.departureTime = scheduledDep;
+            leg.elapsedDeparture = elapsedDeparture;
         }
         path.addLeg(leg);
     }
@@ -98,9 +131,8 @@ uint64_t QuerySearch::pathFingerprint(const Path& path) {
         };
 
         mix(static_cast<uint64_t>(leg.stationId));
-        mix(static_cast<uint64_t>(leg.arrivalTime));
-        mix(static_cast<uint64_t>(leg.arrivalDate));
-        mix(static_cast<uint64_t>(leg.departureTime));
+        mix(static_cast<uint64_t>(leg.elapsedArrival));
+        mix(static_cast<uint64_t>(leg.elapsedDeparture));
         mix(static_cast<uint64_t>(leg.line));
         mix(static_cast<uint64_t>(leg.delaySeconds));
         mix(static_cast<uint64_t>(leg.isWalk));
@@ -343,7 +375,7 @@ void QuerySearch::findPathsByStationIds(uint32_t startStationId, uint32_t endSta
     // Return immediately if start and end stations are the same, with a single-leg path
     if (startStationId == endStationId) {
         auto path = Path();
-        PathLeg leg { startStationId, query.getLookupTime(), query.getLookupDate() };
+        PathLeg leg { startStationId, 0, 0 };
         path.addLeg(leg);
         query.paths = { path };
         query.printRoute(query.paths.back(), pathCount, maxPaths);

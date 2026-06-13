@@ -76,9 +76,8 @@ using TripStopIndex = std::unordered_map<StopKey, size_t, StopKeyHash>;
 
 struct PathLeg {
     uint32_t stationId = 0;
-    uint32_t arrivalTime = 0; // scheduled arrival, seconds from midnight
-    uint32_t arrivalDate = 0; // scheduled arrival date in YYYYMMDD format
-    uint32_t departureTime = 0; // scheduled departure (0 if destination)
+    uint32_t elapsedArrival = 0; // schedule arrival in seconds from search start
+    uint32_t elapsedDeparture = 0; // schedule departure in seconds from search start
     uint32_t line = kNoLine; // 0 = walking, else line id
     trip_id trip = trip_id(); // trip identifier for transit legs
     int32_t delaySeconds = 0; // realtime delay /s if 0 is unknown
@@ -100,39 +99,39 @@ public:
     const std::vector<PathLeg>& getLegs() const { return legs; }
     
     const int32_t getTotalTravelTime() const {
-        int32_t initTime = legs.front().departureTime;
-        int32_t finalTime = legs.back().arrivalTime;
-        if (finalTime < initTime) {
-            finalTime += DateTimeUtils::DAYTIMEu; // account for midnight wrap
-        }
+        if (legs.empty()) return 0;
+        int32_t initTime = static_cast<int32_t>(legs.front().elapsedDeparture);
+        int32_t finalTime = static_cast<int32_t>(legs.back().elapsedArrival);
         return finalTime - initTime;
     }
 
-    time_t getArrivalEpoch() const {
+    time_t getArrivalEpoch(uint32_t baseQueryTimeSec, uint32_t baseLookupDateYYMMDD) const {
         if (legs.empty()) return 0;
         
         const PathLeg& destLeg = legs.back();
         
-        uint32_t yyyymmdd = destLeg.arrivalDate;
+        uint64_t totalAbsSeconds = static_cast<uint64_t>(baseQueryTimeSec) + destLeg.elapsedArrival;
+        
+        if (destLeg.delaySeconds != 0) {
+            totalAbsSeconds += destLeg.delaySeconds;
+        }
+
+        uint32_t daysOffset = static_cast<uint32_t>(totalAbsSeconds / DateTimeUtils::DAYTIME);
+        uint32_t timeOfDaySec = static_cast<uint32_t>(totalAbsSeconds % DateTimeUtils::DAYTIME);
+        uint32_t actualDate = DateTimeUtils::advanceDate(baseLookupDateYYMMDD, static_cast<int>(daysOffset));
+        
         std::tm t = {};
-        t.tm_year = (yyyymmdd / 10000) - 1900;
-        t.tm_mon = ((yyyymmdd / 100) % 100) - 1;
-        t.tm_mday = yyyymmdd % 100;
+        t.tm_year = (actualDate / 10000) - 1900;
+        t.tm_mon = ((actualDate / 100) % 100) - 1;
+        t.tm_mday = actualDate % 100;
         
         // Add the seconds from midnight
         t.tm_hour = 0;
         t.tm_min = 0;
-        t.tm_sec = destLeg.arrivalTime;
+        t.tm_sec = timeOfDaySec; 
         t.tm_isdst = -1; // Let the system determine daylight saving time automatically
         
-        time_t arrivalEpoch = mktime(&t);
-        
-        // Factory in real-time delay tracking if present
-        if (destLeg.delaySeconds != 0) {
-            arrivalEpoch += destLeg.delaySeconds;
-        }
-        
-        return arrivalEpoch;
+        return mktime(&t);
     }
 };
 

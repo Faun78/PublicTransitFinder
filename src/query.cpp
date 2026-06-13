@@ -39,22 +39,28 @@ void Query::printRouteHeader(std::ostream& output, int& pathCount, size_t stopCo
 }
 
 void Query::printRouteWalkingLeg(std::ostream& output, const PathLeg& leg, const PathLeg& nextLeg) const {
+    uint32_t baseTimeSec = getLookupTime();
+    uint32_t nextAbsArrival = baseTimeSec + nextLeg.elapsedArrival;
     output << " -> WALK " << (leg.walkSeconds / 60) << " min to "
            << network.getStationName(nextLeg.stationId)
-           << " @ " << formatTime(nextLeg.arrivalTime);
+           << " @ " << formatTime(nextAbsArrival);
 }
 
 void Query::printRouteTransitLeg(std::ostream& output, const PathLeg& leg, const PathLeg& nextLeg, bool isTransfer) const {
     std::string nextStationName = network.getStationName(nextLeg.stationId);
     output << " -> ";
 
-    uint32_t actualDepTime = leg.departureTime;
+    uint32_t baseTimeSec = getLookupTime();
+    uint32_t absArrival = baseTimeSec + leg.elapsedArrival;
+    uint32_t absDeparture = baseTimeSec + leg.elapsedDeparture;
+
     if (network.isOnlineMode() && leg.delaySeconds) {
-        actualDepTime = QuerySearch::applyRealtimeDelay(leg.departureTime, leg.delaySeconds);
+        absDeparture = QuerySearch::applyRealtimeDelay(absDeparture, leg.delaySeconds);
     }
-    uint32_t waitTime = (actualDepTime >= leg.arrivalTime)
-            ? (actualDepTime - leg.arrivalTime)
-            : (DateTimeUtils::DAYTIME - leg.arrivalTime + actualDepTime);
+
+    uint32_t waitTime = (absDeparture >= absArrival)
+            ? (absDeparture - absArrival)
+            : (DateTimeUtils::DAYTIME - absArrival + absDeparture);
     if (waitTime > 0 && waitTime < DateTimeUtils::DAYTIME) {
         output << "Wait " << (waitTime / 60) << " min";
         if (isTransfer)
@@ -62,13 +68,13 @@ void Query::printRouteTransitLeg(std::ostream& output, const PathLeg& leg, const
         output << " -> ";
     }
 
-    uint32_t scheduledArrival = nextLeg.arrivalTime;
+    uint32_t nextAbsArrival = baseTimeSec + nextLeg.elapsedArrival;
     if (leg.delaySeconds) {
-        scheduledArrival = QuerySearch::applyRealtimeDelay(nextLeg.arrivalTime, -leg.delaySeconds);
+        nextAbsArrival = QuerySearch::applyRealtimeDelay(nextAbsArrival, -leg.delaySeconds);
     }
-    output << "BOARD Line " << network.getLineName(leg.line) << " @ " << formatTime(leg.departureTime)
+    output << "BOARD Line " << network.getLineName(leg.line) << " @ " << formatTime(absDeparture)
            << formatDelay(leg.delaySeconds) << " (arrive " << nextStationName << " @ "
-           << formatTime(scheduledArrival) << formatDelayShort(leg.delaySeconds) << ")";
+           << formatTime(nextAbsArrival) << formatDelayShort(leg.delaySeconds) << ")";
 }
 
 void Query::printRouteDestinationLeg(std::ostream& output) const {
@@ -157,8 +163,10 @@ bool Query::printRoute(const Path& path, int& pathCount, int maxPaths) const {
     for (size_t i = 0; i < legs.size(); ++i) {
         const PathLeg& leg = legs[i];
         std::ostringstream oss;
+        uint32_t baseTimeSec = getLookupTime();
+        uint32_t absArrival = baseTimeSec + leg.elapsedArrival;
         oss << (i + 1) << ". Arrive at " << network.getStationName(leg.stationId)
-            << " @ " << formatTime(leg.arrivalTime);
+            << " @ " << formatTime(absArrival);
 
         if (i + 1 < legs.size()) {
             const PathLeg& nextLeg = legs[i + 1];
@@ -202,9 +210,8 @@ void Query::addWalkingToPathStart(Location startloc) {
         PathLeg leg { };
         leg.isWalk = true;
         leg.stationId = count;
-        leg.arrivalDate = getLookupDate();
-        leg.arrivalTime = getLookupTime();
-        leg.departureTime = getLookupTime();
+        leg.elapsedArrival = 0;
+        leg.elapsedDeparture = 0;
         leg.walkSeconds = static_cast<uint32_t>(calcDistance(startloc, network.getStationLocation(path.getLegs().front().stationId)) / walkingSpeed);
         Path newPath;
         newPath.addLeg(leg);
@@ -235,12 +242,12 @@ void Query::addWalkingToPathEnd(Location endloc) {
         PathLeg leg { };
         leg.isWalk = true;
         leg.stationId = count;
-        leg.arrivalDate = lastTransitLeg.arrivalDate;
-        leg.departureTime = lastTransitLeg.arrivalTime;
+        leg.elapsedArrival = lastTransitLeg.elapsedArrival;
+        leg.elapsedDeparture = lastTransitLeg.elapsedArrival;
 
         uint32_t walkDuration = static_cast<uint32_t>(calcDistance(endloc, network.getStationLocation(lastTransitLeg.stationId)) / walkingSpeed);
         leg.walkSeconds = walkDuration;
-        leg.arrivalTime = lastTransitLeg.arrivalTime + walkDuration; // Arrives after walk duration
+        leg.elapsedArrival = lastTransitLeg.elapsedArrival + walkDuration;
 
         path.addLeg(leg);
     }
@@ -277,62 +284,54 @@ bool Query::exportTripSegmentCsv(std::ostream& output, const std::vector<PathLeg
     if (schedule[idxB].trip != leg.trip || schedule[idxA].trip != leg.trip)
         return false;
 
-    uint32_t boardBaseOffset = schedule[idxB].day_offset + (schedule[idxB].arrival_time / DateTimeUtils::DAYTIME);
+    uint32_t baseDate = getLookupDate();
+    uint32_t baseTimeSec = getLookupTime();
 
+    // Linearly trace real-world absolute time offsets forward from your exact search start configuration
+    int64_t boardAbsoluteSec = static_cast<int64_t>(baseTimeSec) + leg.elapsedDeparture;
+
+    uint32_t boardServiceSec = schedule[idxB].day_offset * DateTimeUtils::DAYTIME + schedule[idxB].arrival_time;
     const auto& nextForLine = network.getNextTripScheduleIndex();
-    if (lid < nextForLine.size()) {
-        const auto& nextIdx = nextForLine[lid];
-        size_t station = idxB;
-        // Iterate through the schedule from boarding to final stop
-        while (station < schedule.size()) {
-            const ScheduleEntry& se = schedule[station];
-            if (se.trip != leg.trip)
-                break;
 
-            uint32_t arrTime = QuerySearch::applyRealtimeDelay(se.arrival_time, delay);
-
-            uint32_t currentStopOffset = se.day_offset + (se.arrival_time / DateTimeUtils::DAYTIME);
-            int32_t daysFromBoarding = static_cast<int32_t>(currentStopOffset) - static_cast<int32_t>(boardBaseOffset);
-            uint32_t arrDate = DateTimeUtils::advanceDate(leg.arrivalDate, daysFromBoarding);
-
-            const Location& loc = network.getStationLocation(se.station_id);
-            bool transferFlag = false;
-            if (se.station_id == leg.stationId && isTransferRow(legs, i))
-                transferFlag = true;
-            if (se.station_id == finalStation && (j + 1 < legs.size()) && isTransferRow(legs, j + 1))
-                transferFlag = true;
-            writeTripSegmentCsvRow(output, network.getStationName(se.station_id), arrDate, arrTime, loc, transferFlag);
-            if (station == idxA)
-                break;
-            if (station >= nextIdx.size())
-                break;
-            size_t n = nextIdx[station];
-            if (n == station || schedule[n].trip != leg.trip)
-                break;
-            station = n;
-        }
-        return true;
-    }
-
-    // If we don't have the next index for this line, fallback to a linear scan
-    // YES GTFS can change the schedule to other stations between stops of the same line.
-    for (size_t station = idxB; station <= idxA && station < schedule.size(); ++station) {
+    size_t station = idxB;
+    while (station <= idxA && station < schedule.size()) {
         const ScheduleEntry& se = schedule[station];
         if (se.trip != leg.trip)
-            continue;
+            break;
 
-        uint32_t arrTime = QuerySearch::applyRealtimeDelay(se.arrival_time, delay);
+        uint32_t currentStopServiceSec = se.day_offset * DateTimeUtils::DAYTIME + se.arrival_time;
+        int64_t serviceTimeDiff = static_cast<int64_t>(currentStopServiceSec) - static_cast<int64_t>(boardServiceSec);
+        if (serviceTimeDiff < 0) serviceTimeDiff = 0;
 
-        uint32_t currentStopOffset = se.day_offset + (se.arrival_time / DateTimeUtils::DAYTIME);
-        int32_t daysFromBoarding = static_cast<int32_t>(currentStopOffset) - static_cast<int32_t>(boardBaseOffset);
-        uint32_t arrDate = DateTimeUtils::advanceDate(leg.arrivalDate, daysFromBoarding);
+        int64_t stopAbsoluteSeconds = boardAbsoluteSec + serviceTimeDiff + delay;
+
+        int32_t dayOffset = 0;
+        while (stopAbsoluteSeconds < 0) {
+            stopAbsoluteSeconds += DateTimeUtils::DAYTIME;
+            dayOffset--;
+        }
+        dayOffset += static_cast<int32_t>(stopAbsoluteSeconds / DateTimeUtils::DAYTIME);
+        uint32_t arrTime = static_cast<uint32_t>(stopAbsoluteSeconds % DateTimeUtils::DAYTIME);
+        uint32_t arrDate = DateTimeUtils::advanceDate(baseDate, dayOffset);
         const Location& loc = network.getStationLocation(se.station_id);
         bool transferFlag = false;
         if (se.station_id == leg.stationId && isTransferRow(legs, i))
             transferFlag = true;
-        if (se.station_id == finalStation && (j + 1 < legs.size()) && isTransferRow(legs, j + 1))
+        if (se.station_id == finalStation && (j + 1 < legs.size()) && isTransferRow(legs, j + j))
             transferFlag = true;
         writeTripSegmentCsvRow(output, network.getStationName(se.station_id), arrDate, arrTime, loc, transferFlag);
+        if (station == idxA)
+            break;
+        if (lid < nextForLine.size() && station < nextForLine[lid].size()) {
+            size_t n = nextForLine[lid][station];
+            if (n == station || schedule[n].trip != leg.trip || n <= station) {
+                station++;
+            } else {
+                station = n;
+            }
+        } else {
+            station++;
+        }
     }
     return true;
 }
@@ -346,41 +345,54 @@ void Query::exportFastestArrivalCsv(std::ostream& output, CsvExportMode mode, si
     const auto& legs = path.getLegs();
 
     output << "station_name,arrival_date,arrival_time,latitude,longitude,line_change\n";
+    if (legs.empty()) return;
+
+    uint32_t baseDate = getLookupDate();
+    uint32_t baseTimeSec = getLookupTime();
+
+    uint32_t lastPrintedStationId = std::numeric_limits<uint32_t>::max();
 
     for (size_t i = 0; i < legs.size(); ++i) {
         const PathLeg& leg = legs[i];
-        // In TransfersOnly mode: print every station
-        if (mode == CsvExportMode::TransfersOnly) {
-            bool transferRow = isTransferRow(legs, i);
-            const Location& location = network.getStationLocation(leg.stationId);
-            writeTripSegmentCsvRow(output, network.getStationName(leg.stationId),
-                    leg.arrivalDate, leg.arrivalTime, location, transferRow);
-            continue;
-        }
 
-        // AllStops mode: expand transit legs to all scheduled stops between boarding and finaling
-        if (mode == CsvExportMode::AllStops) {
-            // Find contiguous segment of legs that belong to the same trip
+        bool expanded = false;
+        if (mode == CsvExportMode::AllStops && !leg.isWalk && leg.trip.id != 0) {
             size_t j = i;
-            while (j + 1 < legs.size() && !legs[j + 1].isWalk && legs[j + 1].trip.id == leg.trip.id)
+            while (j + 1 < legs.size() && !legs[j + 1].isWalk && legs[j + 1].trip.id == leg.trip.id) {
                 ++j;
-            if (exportTripSegmentCsv(output, legs, i, j)) {
-                i = j;
-                continue;
             }
-            if (leg.line != kNoLine && leg.trip.id != 0) {
-                // if we intended to expand but failed, fallthrough to boarding-only row
-                const Location& location = network.getStationLocation(leg.stationId);
-                writeTripSegmentCsvRow(output, network.getStationName(leg.stationId),
-                        leg.arrivalDate, leg.arrivalTime, location, false);
-                continue;
+
+            if (exportTripSegmentCsv(output, legs, i, j)) {
+                lastPrintedStationId = (j + 1 < legs.size()) ? legs[j + 1].stationId : legs[j].stationId;
+                i = j;
+                expanded = true;
             }
         }
 
-        // Default fallback: print station row
-        const Location& location = network.getStationLocation(leg.stationId);
-        writeTripSegmentCsvRow(output, network.getStationName(leg.stationId),
-                leg.arrivalDate, leg.arrivalTime, location, false);
+        if (!expanded) {
+            if (leg.stationId == lastPrintedStationId) {
+                continue;
+            }
+
+            const Location& loc = network.getStationLocation(leg.stationId);
+            // Reconstruct absolute time by tracing forward from the lookup configuration window
+            int64_t totalSeconds = static_cast<int64_t>(baseTimeSec) + leg.elapsedArrival;
+            int32_t dayOffset = 0;
+            while (totalSeconds < 0) {
+                totalSeconds += DateTimeUtils::DAYTIME;
+                dayOffset--;
+            }
+            dayOffset += static_cast<int32_t>(totalSeconds / DateTimeUtils::DAYTIME);
+
+            uint32_t arrTime = static_cast<uint32_t>(totalSeconds % DateTimeUtils::DAYTIME);
+            uint32_t arrDate = DateTimeUtils::advanceDate(baseDate, dayOffset);
+
+            bool transferRow = isTransferRow(legs, i);
+            writeTripSegmentCsvRow(output, network.getStationName(leg.stationId),
+                    arrDate, arrTime, loc, transferRow);
+
+            lastPrintedStationId = leg.stationId;
+        }
     }
 }
 

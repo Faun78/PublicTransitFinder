@@ -14,7 +14,13 @@ private:
 
     static std::string formatTime(time_t time) {
         char buf[9];
-        strftime(buf, sizeof(buf), "%H:%M:%S", localtime(&time));
+        std::tm timeBuf;
+#ifdef _WIN32
+        localtime_s(&timeBuf, &time);
+#else
+        localtime_r(&time, &timeBuf);
+#endif
+        strftime(buf, sizeof(buf), "%H:%M:%S", &timeBuf);
         return std::string(buf);
     }
 
@@ -96,7 +102,6 @@ public:
                 }
 
                 time_t mid = left + (right - left) / 2;
-
                 time_t midNormalizedToMinute = (mid / 60) * 60;
 
                 if (midNormalizedToMinute == lastSeenMinuteEpoch) {
@@ -104,8 +109,12 @@ public:
                 }
                 lastSeenMinuteEpoch = midNormalizedToMinute;
 
-                std::tm midTime = {}; 
+                std::tm midTime = {};
+#ifdef _WIN32
+                localtime_s(&midTime, &midNormalizedToMinute);
+#else
                 localtime_r(&midNormalizedToMinute, &midTime);
+#endif
 
                 q.setTimeInfo(midTime);
                 q.lookUp(start, end, 1);
@@ -116,7 +125,13 @@ public:
                 }
 
                 const Path& primaryPath = q.getPaths().front();
-                time_t pathArrivalEpoch = primaryPath.getArrivalEpoch();
+
+                // Derive the base context variables directly from the dynamic midTime configuration
+                uint32_t stepBaseTimeSec = static_cast<uint32_t>(midTime.tm_hour * 3600 + midTime.tm_min * 60 + midTime.tm_sec);
+                uint32_t stepBaseLookupDate = static_cast<uint32_t>((midTime.tm_year + 1900) * 10000 + (midTime.tm_mon + 1) * 100 + midTime.tm_mday);
+
+                // Supply context explicitly to evaluate target boundaries correctly
+                time_t pathArrivalEpoch = primaryPath.getArrivalEpoch(stepBaseTimeSec, stepBaseLookupDate);
 
                 if (pathArrivalEpoch <= targetArrivalEpoch) {
                     bestDepartureEpoch = midNormalizedToMinute;
@@ -137,7 +152,11 @@ public:
 
         if (foundValidRoute) {
             tm finalDepartureTime;
+#ifdef _WIN32
+            localtime_s(&finalDepartureTime, &bestDepartureEpoch);
+#else
             localtime_r(&bestDepartureEpoch, &finalDepartureTime);
+#endif
             q.setTimeInfo(finalDepartureTime);
             q.lookUp(start, end, maxPaths);
             return { q.getPaths(), "OK" };
